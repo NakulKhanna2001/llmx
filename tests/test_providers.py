@@ -103,3 +103,38 @@ def test_gemini_complete_rate_limit():
     result = provider.complete("Say hello")
     assert result.success is False
     assert result.error_code == 429
+
+
+from llmx.providers.openrouter import OpenRouterProvider
+
+
+@respx.mock
+def test_openrouter_complete_success():
+    respx.post("https://openrouter.ai/api/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json={
+            "choices": [{"message": {"content": "Hello from OpenRouter"}}],
+            "usage": {"total_tokens": 10},
+        })
+    )
+    provider = OpenRouterProvider(api_key="sk-or-test")
+    result = provider.complete("Say hello", model="deepseek/deepseek-coder")
+    assert result.output == "Hello from OpenRouter"
+    assert result.success is True
+
+
+@respx.mock
+def test_openrouter_validate_success():
+    respx.get("https://openrouter.ai/api/v1/auth/key").mock(
+        return_value=httpx.Response(200, json={"data": {"label": "test"}})
+    )
+    provider = OpenRouterProvider(api_key="sk-or-test")
+    assert provider.validate() is True
+
+
+@respx.mock
+def test_openrouter_validate_bad_key():
+    respx.get("https://openrouter.ai/api/v1/auth/key").mock(
+        return_value=httpx.Response(401, json={"error": "unauthorized"})
+    )
+    provider = OpenRouterProvider(api_key="bad")
+    assert provider.validate() is False

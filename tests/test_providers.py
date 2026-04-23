@@ -76,3 +76,30 @@ def test_openai_complete_rate_limit():
     result = provider.complete("Say hello")
     assert result.success is False
     assert result.error_code == 429
+
+
+from llmx.providers.gemini import GeminiProvider
+
+
+@respx.mock
+def test_gemini_complete_success():
+    respx.post("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent").mock(
+        return_value=httpx.Response(200, json={
+            "candidates": [{"content": {"parts": [{"text": "Hello from Gemini"}]}}],
+        })
+    )
+    provider = GeminiProvider(api_key="gem_test")
+    result = provider.complete("Say hello")
+    assert result.output == "Hello from Gemini"
+    assert result.success is True
+
+
+@respx.mock
+def test_gemini_complete_rate_limit():
+    respx.post("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent").mock(
+        return_value=httpx.Response(429, json={"error": {"message": "rate limited"}})
+    )
+    provider = GeminiProvider(api_key="gem_test")
+    result = provider.complete("Say hello")
+    assert result.success is False
+    assert result.error_code == 429

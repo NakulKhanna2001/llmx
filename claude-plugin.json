@@ -1,0 +1,16 @@
+{
+  "name": "llmx",
+  "description": "Multi-LLM orchestrator — decomposes prompts into parallel subtasks across providers",
+  "version": "0.1.0",
+  "skills": [
+    {
+      "name": "llmx",
+      "description": "Decompose a complex prompt into subtasks, execute across multiple LLM providers in parallel, synthesize results",
+      "command": "/llmx"
+    }
+  ],
+  "mcp_server": {
+    "command": "python",
+    "args": ["-m", "llmx.server"]
+  }
+}

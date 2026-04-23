@@ -138,3 +138,42 @@ def test_openrouter_validate_bad_key():
     )
     provider = OpenRouterProvider(api_key="bad")
     assert provider.validate() is False
+
+
+from llmx.providers.ollama import OllamaProvider
+
+
+@respx.mock
+def test_ollama_complete_success():
+    respx.post("http://localhost:11434/api/generate").mock(
+        return_value=httpx.Response(200, json={
+            "response": "Hello from Ollama",
+            "done": True,
+        })
+    )
+    provider = OllamaProvider(model="llama3")
+    result = provider.complete("Say hello")
+    assert result.output == "Hello from Ollama"
+    assert result.success is True
+
+
+@respx.mock
+def test_ollama_validate_running():
+    respx.get("http://localhost:11434/api/tags").mock(
+        return_value=httpx.Response(200, json={
+            "models": [{"name": "llama3"}, {"name": "codellama"}],
+        })
+    )
+    provider = OllamaProvider()
+    is_valid, models = provider.validate_with_models()
+    assert is_valid is True
+    assert "llama3" in models
+
+
+@respx.mock
+def test_ollama_validate_not_running():
+    respx.get("http://localhost:11434/api/tags").mock(side_effect=httpx.ConnectError("refused"))
+    provider = OllamaProvider()
+    is_valid, models = provider.validate_with_models()
+    assert is_valid is False
+    assert models == []

@@ -48,16 +48,35 @@ If the top provider is down or rate-limited, execution automatically falls to th
 
 ## Setup
 
-```bash
-# Install
-pip install llmx
+### 1. Install dependencies
 
-# First run triggers interactive setup
-# Or run manually:
-/llmx --setup
+```bash
+cd ~/llmx
+python -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
 ```
 
-The setup wizard prompts for each API key, validates it with a live test call, and saves to `~/.llmx/config.yaml`. Skipped providers are excluded from routing. Ollama is detected automatically.
+### 2. Register as a Claude Code MCP server
+
+Add this to your `~/.claude/settings.json` under `"mcpServers"`:
+
+```json
+{
+  "mcpServers": {
+    "llmx": {
+      "command": "/Users/YOUR_USERNAME/llmx/.venv/bin/python",
+      "args": ["-m", "llmx.server"]
+    }
+  }
+}
+```
+
+Or add a project-level `.mcp.json` in any repo where you want `/llmx` available.
+
+### 3. Configure providers
+
+On first use, Claude will call `llmx_setup` to run the interactive wizard. It prompts for each API key, validates it with a live test call, and saves to `~/.llmx/config.yaml`. Skipped providers are excluded from routing. Ollama is detected automatically.
 
 ## Quality Assurance
 

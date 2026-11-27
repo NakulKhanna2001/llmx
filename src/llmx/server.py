@@ -1,27 +1,51 @@
+import asyncio
 import json
+import shlex
+import sys
+from dataclasses import asdict, dataclass, field
+from threading import Lock
+from uuid import uuid4
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
-from .config import load_config, DEFAULT_CONFIG_PATH
-from .dag import Dag, validate_dag, format_dag_preview, DagValidationError
-from .executor import DagExecutor
-from .fallback import get_provider_chain
+from .config import DEFAULT_CONFIG_PATH, LlmxConfig, load_config
+from .dag import Dag, DagValidationError, format_dag_preview, validate_dag
+from .executor import DagExecutor, ExecutionResult
 from .providers import PROVIDER_REGISTRY
 from .providers.base import BaseProvider
-from .wizard import run_wizard
+from .wizard import discover_ollama
 
 server = Server("llmx")
 
-# In-memory store for last execution (for retry)
-_last_dag: Dag | None = None
-_last_providers: dict[str, BaseProvider] = {}
-_last_available: list[str] = []
+
+@dataclass
+class SavedRun:
+    executor: DagExecutor
+    result: ExecutionResult
+    # A cancelled MCP request can leave its worker running; serialize in the worker.
+    lock: Lock = field(default_factory=Lock)
+
+    def retry(self, node_id, skip_providers, replacement_output):
+        with self.lock:
+            return self.executor.retry_node(self.result, node_id, skip_providers, replacement_output)
+
+
+# stdio serves one client. IDs keep overlapping calls from sharing node outputs.
+# Bound the lifetime of provider objects, prompt data and attachments kept for retries.
+RECENT_RUN_LIMIT = 8
+_runs: dict[str, SavedRun] = {}
+
+
+def _runtime_config() -> LlmxConfig:
+    config = load_config()
+    config.providers["ollama"] = discover_ollama()
+    return config
 
 
 def _build_providers() -> tuple[dict[str, BaseProvider], list[str]]:
-    config = load_config()
+    config = _runtime_config()
     available = config.get_available_providers()
     providers: dict[str, BaseProvider] = {}
 
@@ -37,7 +61,7 @@ def _build_providers() -> tuple[dict[str, BaseProvider], list[str]]:
             api_key = info.get("api_key", "")
             providers[name] = cls(api_key=api_key)
 
-    return providers, available
+    return providers, list(providers)
 
 
 @server.list_tools()
@@ -45,7 +69,7 @@ async def list_tools() -> list[Tool]:
     return [
         Tool(
             name="llmx_setup",
-            description="Run the interactive setup wizard to configure LLM provider API keys",
+            description="Detect local Ollama models and show how to configure optional provider keys privately in a terminal",
             inputSchema={"type": "object", "properties": {}},
         ),
         Tool(
@@ -83,15 +107,23 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="llmx_retry_node",
-            description="Re-execute a single node, skipping providers that already failed",
+            description="Retry a node or record a client-provided answer. Returns affected downstream nodes.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "node_id": {"type": "string"},
+                    "execution_id": {
+                        "type": "string",
+                        "description": "ID returned by execute. Defaults to the last completed run.",
+                    },
+                    "replacement_output": {
+                        "type": "string", "minLength": 1,
+                        "description": "Supply a corrected node answer directly without a provider call.",
+                    },
                     "skip_providers": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Providers to skip (already tried)",
+                        "description": "Override the default list of providers already tried for this input.",
                     },
                 },
                 "required": ["node_id"],
@@ -102,110 +134,83 @@ async def list_tools() -> list[Tool]:
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    global _last_dag, _last_providers, _last_available
 
-    if name == "llmx_setup":
-        result = run_wizard()
-        return [TextContent(type="text", text=json.dumps(result, indent=2))]
-
-    if name == "llmx_status":
-        config = load_config()
-        available = config.get_available_providers()
+    if name in {"llmx_setup", "llmx_status"}:
+        config = await asyncio.to_thread(_runtime_config)
+        available = [p for p in config.get_available_providers() if p in PROVIDER_REGISTRY]
         status = {
             "configured": available,
             "missing": [p for p in PROVIDER_REGISTRY if p not in available],
             "config_path": str(DEFAULT_CONFIG_PATH),
         }
+        if name == "llmx_setup":
+            status["active_providers"] = available
+            argv = [sys.executable, "-m", "llmx", "setup"]
+            status["setup_argv"] = argv
+            if sys.platform == "win32":
+                executable = sys.executable.replace("'", "''")
+                status["setup_command"] = f"& '{executable}' -m llmx setup"
+                terminal = "PowerShell"
+            else:
+                status["setup_command"] = shlex.join(argv)
+                terminal = "your terminal"
+            status["instructions"] = (
+                f"Run the setup command in {terminal} to enter optional cloud keys. "
+                "Ollama models installed locally are detected automatically."
+            )
         return [TextContent(type="text", text=json.dumps(status, indent=2))]
 
     if name == "llmx_preview_dag":
         try:
-            dag = Dag(**arguments["dag"])
-            validate_dag(dag)
-            preview = format_dag_preview(dag)
+            preview = format_dag_preview(Dag(**arguments["dag"]))
             return [TextContent(type="text", text=preview)]
-        except (DagValidationError, Exception) as e:
-            return [TextContent(type="text", text=f"DAG validation error: {e}")]
+        except (ValueError, TypeError, KeyError, DagValidationError) as exc:
+            return [TextContent(type="text", text=f"DAG validation error: {exc}")]
 
     if name == "llmx_execute_dag":
         try:
             dag = Dag(**arguments["dag"])
             validate_dag(dag)
-            providers, available = _build_providers()
-
-            _last_dag = dag
-            _last_providers = providers
-            _last_available = available
-
+            providers, available = await asyncio.to_thread(_build_providers)
             executor = DagExecutor(dag, providers, available)
-            result = executor.execute()
-
+            result = await asyncio.to_thread(executor.execute)
+            execution_id = uuid4().hex
+            _runs[execution_id] = SavedRun(executor, result)
+            if len(_runs) > RECENT_RUN_LIMIT:
+                del _runs[next(iter(_runs))]
             output = {
-                "results": {},
+                "execution_id": execution_id,
+                "results": {node_id: asdict(value) for node_id, value in result.results.items()},
                 "execution_time_ms": result.execution_time_ms,
                 "retries": result.retries,
             }
-            for node_id, node_result in result.results.items():
-                output["results"][node_id] = {
-                    "output": node_result.output,
-                    "success": node_result.success,
-                    "provider": node_result.provider,
-                    "model": node_result.model,
-                    "latency_ms": node_result.latency_ms,
-                    "fallback_exhausted": node_result.fallback_exhausted,
-                }
-
             return [TextContent(type="text", text=json.dumps(output, indent=2))]
-        except (DagValidationError, Exception) as e:
-            return [TextContent(type="text", text=f"Execution error: {e}")]
+        except Exception as exc:
+            return [TextContent(type="text", text=f"Execution error: {exc}")]
 
     if name == "llmx_retry_node":
-        node_id = arguments["node_id"]
-        skip = arguments.get("skip_providers", [])
-
-        if _last_dag is None:
+        execution_id = arguments.get("execution_id")
+        if execution_id is None:
+            execution_id = next(reversed(_runs), None)
+        if execution_id is None:
             return [TextContent(type="text", text="No previous DAG execution found")]
-
-        node = next((n for n in _last_dag.nodes if n.id == node_id), None)
-        if node is None:
-            return [TextContent(type="text", text=f"Node {node_id} not found in last DAG")]
-
-        chain = get_provider_chain(node.category.value, _last_available, skip_providers=skip)
-        if not chain:
-            return [TextContent(type="text", text=json.dumps({
-                "node_id": node_id,
-                "success": False,
-                "fallback_exhausted": True,
-            }))]
-
-        prompt = node.task
-        # Substitute from last execution outputs
-        import re
-        for match in re.finditer(r"\{(n\d+)\}", prompt):
-            dep_id = match.group(1)
-            # Get from last execution context if available
-            prompt = prompt.replace(f"{{{dep_id}}}", "")
-
-        for provider_name in chain:
-            provider = _last_providers.get(provider_name)
-            if provider is None:
-                continue
-            result = provider.complete(prompt)
-            if result.success:
-                return [TextContent(type="text", text=json.dumps({
-                    "node_id": node_id,
-                    "output": result.output,
-                    "success": True,
-                    "provider": result.provider,
-                    "model": result.model,
-                    "latency_ms": result.latency_ms,
-                }))]
-
-        return [TextContent(type="text", text=json.dumps({
-            "node_id": node_id,
-            "success": False,
-            "fallback_exhausted": True,
-        }))]
+        run = _runs.get(execution_id)
+        if run is None:
+            return [TextContent(type="text", text="Unknown or expired execution_id")]
+        node_id = arguments["node_id"]
+        if node_id not in run.executor.nodes:
+            return [TextContent(type="text", text=f"Node {node_id} not found in DAG")]
+        replacement = arguments.get("replacement_output")
+        if replacement is not None and (not isinstance(replacement, str) or not replacement.strip()):
+            return [TextContent(type="text", text="replacement_output must be nonblank text")]
+        value, invalidated = await asyncio.to_thread(
+            run.retry, node_id, arguments.get("skip_providers"), replacement
+        )
+        output = {
+            "execution_id": execution_id, "node_id": node_id,
+            **asdict(value), "invalidated_nodes": invalidated,
+        }
+        return [TextContent(type="text", text=json.dumps(output, indent=2))]
 
     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
@@ -216,5 +221,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())

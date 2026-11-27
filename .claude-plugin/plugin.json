@@ -1,0 +1,14 @@
+{
+  "name": "llmx",
+  "version": "0.1.0",
+  "description": "Run dependent tasks across configured LLM providers and review their answers in Claude Code.",
+  "author": {"name": "Nakul Khanna"},
+  "license": "MIT",
+  "repository": "https://github.com/NakulKhanna2001/llmx",
+  "mcpServers": {
+    "llmx": {
+      "command": "llmx",
+      "args": ["serve"]
+    }
+  }
+}

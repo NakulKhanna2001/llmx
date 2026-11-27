@@ -9,7 +9,7 @@ CATEGORY_RANKINGS: dict[str, list[str]] = {
 
 # Category-specific models for OpenRouter
 OPENROUTER_CATEGORY_MODELS: dict[str, str] = {
-    "code": "deepseek/deepseek-coder",
+    "code": "deepseek/deepseek-v3.2",
     "research": "perplexity/sonar",
 }
 

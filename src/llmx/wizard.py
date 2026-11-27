@@ -1,117 +1,48 @@
+from pathlib import Path
+
 from rich.console import Console
 from rich.prompt import Prompt
-from rich.panel import Panel
-from rich.text import Text
 
-from .config import LlmxConfig, save_config, DEFAULT_CONFIG_PATH
-from .providers.groq import GroqProvider
-from .providers.openai import OpenAIProvider
-from .providers.gemini import GeminiProvider
-from .providers.openrouter import OpenRouterProvider
+from .config import DEFAULT_CONFIG_PATH, load_config, save_provider_updates
+from .providers import PROVIDER_REGISTRY
 from .providers.ollama import OllamaProvider
 
 console = Console()
 
-PROVIDER_INFO = [
-    {
-        "name": "groq",
-        "label": "Groq",
-        "description": "Fast inference for simple tasks",
-        "url": "https://console.groq.com/keys",
-        "key_prefix": "gsk_",
-    },
-    {
-        "name": "openai",
-        "label": "OpenAI",
-        "description": "General reasoning, creative writing",
-        "url": "https://platform.openai.com/api-keys",
-        "key_prefix": "sk-",
-    },
-    {
-        "name": "gemini",
-        "label": "Google Gemini",
-        "description": "Large context, multimodal",
-        "url": "https://aistudio.google.com/apikey",
-        "key_prefix": "",
-    },
-    {
-        "name": "openrouter",
-        "label": "OpenRouter",
-        "description": "DeepSeek (code), Perplexity (research)",
-        "url": "https://openrouter.ai/keys",
-        "key_prefix": "sk-or-",
-    },
-]
+CLOUD_PROVIDERS = {
+    "groq": ("Groq", "https://console.groq.com/keys"),
+    "openai": ("OpenAI", "https://platform.openai.com/api-keys"),
+    "gemini": ("Google Gemini", "https://aistudio.google.com/apikey"),
+    "openrouter": ("OpenRouter", "https://openrouter.ai/keys"),
+}
 
 
-def run_wizard() -> dict:
-    console.print(Panel(
-        Text("llmx Setup Wizard", style="bold cyan", justify="center"),
-        subtitle="Configure your LLM providers",
-    ))
-    console.print()
+def discover_ollama() -> dict:
+    reachable, models = OllamaProvider().validate_with_models()
+    return {"available": bool(reachable and models), "models": models}
 
-    config = LlmxConfig()
-    total = len(PROVIDER_INFO) + 1  # +1 for Ollama
-    active_count = 0
 
-    for i, info in enumerate(PROVIDER_INFO, 1):
-        console.print(f"[bold][{i}/{total}] {info['label']}[/bold] — {info['description']}")
-        console.print(f"       Get a key at: [link]{info['url']}[/link]")
-
-        key = Prompt.ask(
-            "       Enter key (or press Enter to skip)",
-            default="",
-            show_default=False,
-        )
-
-        if not key:
-            console.print("       [dim]Skipped[/dim]")
-            config.providers[info["name"]] = {"api_key": None, "validated": False}
-        else:
-            console.print("       Validating...", end=" ")
-            provider_cls = {
-                "groq": GroqProvider,
-                "openai": OpenAIProvider,
-                "gemini": GeminiProvider,
-                "openrouter": OpenRouterProvider,
-            }[info["name"]]
-            provider = provider_cls(api_key=key)
-            valid = provider.validate()
-
-            if valid:
-                console.print("[green]Validated[/green]")
-                config.providers[info["name"]] = {"api_key": key, "validated": True}
-                active_count += 1
+def run_wizard(path: Path = DEFAULT_CONFIG_PATH) -> dict:
+    original = load_config(path)
+    updates = {}
+    console.print("[bold]Configure llmx providers[/bold]")
+    console.print("Cloud keys are optional. Enter keeps an existing setting; a dash removes it.")
+    console.print("Entering a new key validates it with its provider and may use API credits.")
+    for name, (label, url) in CLOUD_PROVIDERS.items():
+        console.print(f"\n[bold]{label}[/bold] — {url}")
+        key = Prompt.ask("API key", password=True, default="", show_default=False).strip()
+        if key == "-":
+            updates[name] = None
+        elif key:
+            if PROVIDER_REGISTRY[name](api_key=key).validate():
+                updates[name] = {"api_key": key, "validated": True}
+                console.print("Key validated.")
             else:
-                console.print("[red]Failed[/red] — key will not be used")
-                config.providers[info["name"]] = {"api_key": key, "validated": False}
+                console.print("Validation failed. The previous setting was retained.")
 
-        console.print()
-
-    # Ollama
-    console.print(f"[bold][{total}/{total}] Ollama[/bold] — Local fallback, no key needed")
-    console.print("       Checking localhost:11434...", end=" ")
-    ollama = OllamaProvider()
-    is_valid, models = ollama.validate_with_models()
-
-    if is_valid:
-        console.print(f"[green]Running[/green] — models: {', '.join(models)}")
-        config.providers["ollama"] = {"available": True, "models": models}
-        active_count += 1
-    else:
-        console.print("[yellow]Not running[/yellow]")
-        config.providers["ollama"] = {"available": False, "models": []}
-
-    console.print()
-    save_config(config)
-    console.print(Panel(
-        f"[bold green]{active_count}/{total} providers active[/bold green]\n"
-        f"Config saved to {DEFAULT_CONFIG_PATH}",
-        title="Setup Complete",
-    ))
-
-    return {
-        "active_providers": config.get_available_providers(),
-        "config_path": str(DEFAULT_CONFIG_PATH),
-    }
+    updates["ollama"] = discover_ollama()
+    config = save_provider_updates(path, original, updates)
+    active = config.get_available_providers()
+    console.print("Configured providers:", ", ".join(active) or "none", markup=False)
+    console.print(f"Saved configuration to {path}.", markup=False)
+    return {"active_providers": active, "config_path": str(path)}

@@ -86,3 +86,31 @@ def test_compute_waves():
     )
     waves = compute_waves(dag)
     assert waves == [["n1", "n2"], ["n3"]]
+
+
+def test_duplicate_dependency_is_not_reported_as_a_cycle():
+    dag = Dag(id="d", prompt="test", nodes=[
+        DagNode(id="root", task="source", category="speed"),
+        DagNode(id="child", task="{root}", category="speed", depends_on=["root", "root"]),
+    ])
+    with pytest.raises(DagValidationError, match="Duplicate dependency"):
+        validate_dag(dag)
+
+
+@pytest.mark.parametrize("reference", ["{n42}", "{known}"])
+def test_node_placeholder_must_be_a_declared_dependency(reference):
+    dag = Dag(id="d", prompt="test", nodes=[
+        DagNode(id="known", task="source", category="speed"),
+        DagNode(id="consumer", task=reference, category="speed"),
+    ])
+    with pytest.raises(DagValidationError, match="placeholder"):
+        validate_dag(dag)
+
+
+def test_rejects_empty_plans_and_blank_tasks():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        Dag(id="empty", prompt="Summarize the data", nodes=[])
+    with pytest.raises(ValidationError):
+        DagNode(id="node", task="  ", category="speed")

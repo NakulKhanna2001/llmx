@@ -1,7 +1,11 @@
+import re
 from enum import Enum
-from typing import Any
+from graphlib import CycleError, TopologicalSorter
+from typing import Annotated
 
-from pydantic import BaseModel, field_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field
+
+from .attachments import Attachment
 
 
 class Category(str, Enum):
@@ -17,74 +21,77 @@ class DagValidationError(Exception):
     pass
 
 
+def nonblank(value: str) -> str:
+    if not value.strip():
+        raise ValueError("A nonblank value is required")
+    return value
+
+
+NonblankText = Annotated[str, AfterValidator(nonblank)]
+
+
 class DagNode(BaseModel):
-    id: str
-    task: str
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    id: NonblankText
+    task: NonblankText
+    attachments: list[Attachment] = Field(default_factory=list, max_length=4)
     category: Category
-    depends_on: list[str] = []
+    depends_on: list[str] = Field(default_factory=list)
 
 
 class Dag(BaseModel):
-    id: str
-    prompt: str
-    nodes: list[DagNode]
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    id: NonblankText
+    prompt: NonblankText
+    nodes: list[DagNode] = Field(min_length=1)
+
+
+# Replace declared dependency names only. Other braces, e.g. JSON examples, are literal.
+PLACEHOLDER = re.compile(r"\{([^{}]+)\}")
+
+
+def prepare_graph(dag: Dag) -> TopologicalSorter:
+    nodes = {}
+    for node in dag.nodes:
+        if node.id in nodes:
+            raise DagValidationError(f"Duplicate node id: {node.id}")
+        nodes[node.id] = node
+
+    graph = TopologicalSorter()
+    for node in dag.nodes:
+        dependencies = set(node.depends_on)
+        if len(dependencies) != len(node.depends_on):
+            raise DagValidationError(f"Duplicate dependency in node '{node.id}'")
+        for dep in node.depends_on:
+            if dep not in nodes:
+                raise DagValidationError(f"Node '{node.id}' depends on unknown node '{dep}'")
+        for ref in PLACEHOLDER.findall(node.task):
+            if (ref in nodes or re.fullmatch(r"n\d+", ref)) and ref not in dependencies:
+                raise DagValidationError(
+                    f"Node '{node.id}' uses placeholder '{{{ref}}}' without a declared dependency"
+                )
+        graph.add(node.id, *node.depends_on)
+
+    try:
+        graph.prepare()
+    except CycleError as exc:
+        raise DagValidationError("Circular dependency detected in DAG") from exc
+    return graph
 
 
 def validate_dag(dag: Dag) -> None:
-    node_ids = [n.id for n in dag.nodes]
-
-    # Check duplicate IDs
-    if len(node_ids) != len(set(node_ids)):
-        seen = set()
-        for nid in node_ids:
-            if nid in seen:
-                raise DagValidationError(f"Duplicate node id: {nid}")
-            seen.add(nid)
-
-    id_set = set(node_ids)
-
-    # Check all dependencies reference existing nodes
-    for node in dag.nodes:
-        for dep in node.depends_on:
-            if dep not in id_set:
-                raise DagValidationError(f"Node '{node.id}' depends on unknown node '{dep}'")
-
-    # Check for circular dependencies via topological sort
-    in_degree = {n.id: len(n.depends_on) for n in dag.nodes}
-    deps_map = {n.id: set(n.depends_on) for n in dag.nodes}
-    queue = [nid for nid, deg in in_degree.items() if deg == 0]
-    visited = 0
-
-    while queue:
-        current = queue.pop(0)
-        visited += 1
-        for node in dag.nodes:
-            if current in deps_map[node.id]:
-                deps_map[node.id].discard(current)
-                in_degree[node.id] -= 1
-                if in_degree[node.id] == 0:
-                    queue.append(node.id)
-
-    if visited != len(dag.nodes):
-        raise DagValidationError("Circular dependency detected in DAG")
+    prepare_graph(dag)
 
 
 def compute_waves(dag: Dag) -> list[list[str]]:
-    validate_dag(dag)
-    remaining = {n.id: set(n.depends_on) for n in dag.nodes}
+    graph = prepare_graph(dag)
     waves = []
-
-    while remaining:
-        wave = [nid for nid, deps in remaining.items() if len(deps) == 0]
-        if not wave:
-            raise DagValidationError("Circular dependency detected in DAG")
-        wave.sort()  # deterministic ordering
+    while graph.is_active():
+        wave = sorted(graph.get_ready())
         waves.append(wave)
-        for nid in wave:
-            del remaining[nid]
-        for deps in remaining.values():
-            deps -= set(wave)
-
+        graph.done(*wave)
     return waves
 
 
